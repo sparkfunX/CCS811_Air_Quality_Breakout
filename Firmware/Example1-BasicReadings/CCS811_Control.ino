@@ -1,26 +1,8 @@
 /*
-  CCS811 Air Quality Sensor Example Code
-  By: Nathan Seidle
-  SparkFun Electronics
-  Date: February 7th, 2017
-  License: This code is public domain but you buy me a beer if you use this and we meet someday (Beerware license).
 
-  Sends the humidity and temperature from a separate sensor to the CCS811 so
-  that the CCS811 can adjust its algorithm.
+  Basic control functions of the CCS811
 
-  Hardware Connections (Breakoutboard to Arduino):
-  3.3V = 3.3V
-  GND = GND
-  SDA = A4
-  SCL = A5
-  WAKE = D5 - Optional, can be left unconnected
-
-  Serial.print it out at 9600 baud to serial monitor.
 */
-
-#include <Wire.h>
-
-#define CCS811_ADDR 0x5B //7-bit unshifted default I2C Address
 
 //Register addresses
 #define CSS811_STATUS 0x00
@@ -39,55 +21,7 @@
 #define CSS811_APP_START 0xF4
 #define CSS811_SW_RESET 0xFF
 
-//These are the air quality values obtained from the sensor
-unsigned int tVOC = 0;
-unsigned int CO2 = 0;
-
-void setup()
-{
-  Serial.begin(9600);
-  Serial.println("CCS811 Read Example");
-
-  pinMode(WAKE, OUTPUT);
-  digitalWrite(WAKE, LOW);
-
-  Wire.begin();
-
-  configureCCS811(); //Turn on sensor
-
-  stopped here
-
-  unsigned int result = getBaseline();
-
-  Serial.print("baseline for this sensor: 0x");
-  if(result < 0x100) Serial.print("0");
-  if(result < 0x10) Serial.print("0");
-  Serial.println(result, HEX);
-
-}
-
-void loop()
-{
-  if (dataAvailable())
-  {
-    readAlgorithmResults(); //Calling this function updates the global tVOC and CO2 variables
-
-    Serial.print("CO2[");
-    Serial.print(CO2);
-    Serial.print("] tVOC[");
-    Serial.print(tVOC);
-    Serial.print("] millis[");
-    Serial.print(millis());
-    Serial.print("]");
-    Serial.println();
-  }
-  else if (checkForError())
-  {
-    printError();
-  }
-
-  delay(1000); //Wait for next reading
-}
+#define CCS811_ADDR 0x5B //7-bit unshifted default I2C Address
 
 //Updates the total voltatile organic compounds (TVOC) in parts per billion (PPB)
 //and the CO2 value
@@ -110,14 +44,15 @@ void readAlgorithmResults()
 }
 
 //Turns on the sensor and configures it with default settings
-void configureCCS811()
+boolean configureCCS811()
 {
   //Verify the hardware ID is what we expect
   byte hwID = readRegister(0x20); //Hardware ID should be 0x81
   if (hwID != 0x81)
   {
-    Serial.println("CCS811 not found. Please check wiring.");
-    while (1); //Freeze!
+    Serial.print("Hardware ID wrong: 0x");
+    Serial.println(hwID, HEX);
+    return (false);
   }
 
   //Check for errors
@@ -125,14 +60,14 @@ void configureCCS811()
   {
     Serial.println("Error at Startup");
     printError();
-    while (1); //Freeze!
+    return (false);
   }
 
   //Tell App to Start
   if (appValid() == false)
   {
     Serial.println("Error: App not valid.");
-    while (1); //Freeze!
+    return (false);
   }
 
   //Write to this register to start app
@@ -145,7 +80,7 @@ void configureCCS811()
   {
     Serial.println("Error at AppStart");
     printError();
-    while (1); //Freeze!
+    return (false);
   }
 
   //Set Drive Mode
@@ -156,8 +91,10 @@ void configureCCS811()
   {
     Serial.println("Error at setDriveMode");
     printError();
-    while (1); //Freeze!
+    return (false);
   }
+
+  return (true); //All set!
 }
 
 //Checks to see if error bit is set
@@ -255,29 +192,63 @@ void setDriveMode(byte mode)
 
 //Given a temp and humidity, write this data to the CSS811 for better compensation
 //This function expects the humidity and temp to come in as floats
+//From Programming Guide, page 18
 void setEnvironmentalData(float relativeHumidity, float temperature)
 {
-  int rH = relativeHumidity * 1000; //42.348 becomes 42348
-  int temp = temperature * 1000; //23.2 becomes 23200
+  long rH = relativeHumidity * 1000; //42.348 becomes 42348
+  long temp = temperature * 1000; //23.2 becomes 23200
 
   byte envData[4];
 
-  //Split value into 7-bit integer and 9-bit fractional
-  envData[0] = ((rH % 1000) / 100) > 7 ? (rH / 1000 + 1) << 1 : (rH / 1000) << 1;
-  envData[1] = 0; //CCS811 only supports increments of 0.5 so bits 7-0 will always be zero
+  //Split relative humidity value into 7-bit integer and 1-bit fractional
+  //From our example: 42348 % 1000 = 348
+  //348 / 100 = 3
+  //This is basically .3 which is not high enough to round up (above .7 is required to round up)
+  if (((rH % 1000) / 100) > 7)
+    envData[0] = (rH / 1000 + 1) << 1; //Add 1% to the humidity and shift to 7 bits
+  else
+    envData[0] = (rH / 1000) << 1; //Just shift to fit in the 7 bit spot
+
+  //Now check to see if there is a half of % that we can stick in bit 0
+  //If our .3 is more than .2 and less than .8 then we can say this is 42.5% humidty
   if (((rH % 1000) / 100) > 2 && (((rH % 1000) / 100) < 8))
   {
     envData[0] |= 1; //Set 9th bit of fractional to indicate 0.5%
   }
 
+  envData[1] = 0; //CCS811 only supports increments of 0.5 (bit 0 of byte 0) so byte 1 will always be zero
+
+  //Now we deal with temperature
   temp += 25000; //Add the 25C offset
-  //Split value into 7-bit integer and 9-bit fractional
-  envData[2] = ((temp % 1000) / 100) > 7 ? (temp / 1000 + 1) << 1 : (temp / 1000) << 1;
-  envData[3] = 0;
+
+  //Split value into 7-bit integer and 1-bit fractional
+  //23200 + 25000 = 48200
+  //48200 % 1000 = 200
+  //200 / 100 = 2
+  //This is basically .2 C which is not high enough to round up (above .7 is required to round up)
+  if (((temp % 1000) / 100) > 7)
+  {
+    envData[2] = (temp / 1000 + 1) << 1; //Add 1 degree C to the temp and shift to 7 bits
+  }
+  else
+  {
+    envData[2] = (temp / 1000) << 1; //Don't add anything, just shift to fit into 7 bits
+  }
+
+  //Now check to see if there is a half a degree that we can stick in bit 0
+  //If our .2 C is not .2 AND less than .8 so we call our temp 48C with no fraction of C in bit 0
   if (((temp % 1000) / 100) > 2 && (((temp % 1000) / 100) < 8))
   {
     envData[2] |= 1;  //Set 9th bit of fractional to indicate 0.5C
   }
+
+  envData[3] = 0; //CCS811 only supports increments of 0.5 (bit 0 of byte 0) so byte 1 will always be zero
+
+  /*Serial.println("envData: ");
+  Serial.println(envData[0], HEX);
+  Serial.println(envData[1], HEX);
+  Serial.println(envData[2], HEX);
+  Serial.println(envData[3], HEX);*/
 
   Wire.beginTransmission(CCS811_ADDR);
   Wire.write(CSS811_ENV_DATA); //We want to write our RH and temp data to the ENV register
@@ -285,6 +256,7 @@ void setEnvironmentalData(float relativeHumidity, float temperature)
   Wire.write(envData[1]);
   Wire.write(envData[2]);
   Wire.write(envData[3]);
+  Wire.endTransmission();
 }
 
 //Reads from a give location from the CSS811
@@ -307,3 +279,4 @@ void writeRegister(byte addr, byte val)
   Wire.write(val);
   Wire.endTransmission();
 }
+
